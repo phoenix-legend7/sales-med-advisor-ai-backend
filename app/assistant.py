@@ -54,53 +54,12 @@ class Assistant:
 
     async def assistant_chat_with_file(self, messages, file_ids, model='gpt-4o'):
         """Create a chat completion that includes file context"""
-        # Create an Assistant
-        assistant = await openai_client.beta.assistants.create(
-            name="PDF Assistant",
+        res = await openai_client.chat.completions.create(
             model=model,
-            tools=[{"type": "retrieval"}],
+            messages=messages,
             file_ids=file_ids
         )
-        
-        # Create a Thread
-        thread = await openai_client.beta.threads.create()
-        
-        # Add user message to the thread
-        user_message = messages[-1]['content']  # Get the latest user message
-        await openai_client.beta.threads.messages.create(
-            thread_id=thread.id,
-            role="user",
-            content=user_message
-        )
-        
-        # Run the Assistant
-        run = await openai_client.beta.threads.runs.create(
-            thread_id=thread.id,
-            assistant_id=assistant.id
-        )
-        
-        # Wait for the run to complete
-        while run.status != "completed":
-            await asyncio.sleep(1)
-            run = await openai_client.beta.threads.runs.retrieve(
-                thread_id=thread.id,
-                run_id=run.id
-            )
-            
-            if run.status == "failed":
-                return "Sorry, I couldn't process that request."
-        
-        # Get the messages
-        messages = await openai_client.beta.threads.messages.list(
-            thread_id=thread.id
-        )
-        
-        # Get the assistant's response (most recent message from assistant)
-        for msg in messages.data:
-            if msg.role == "assistant":
-                return msg.content[0].text.value
-        
-        return "No response generated."
+        return res.choices[0].message.content
     
     async def upload_pdf(self, file_path, file_name):
         """Upload a PDF file to OpenAI and return the file ID"""
