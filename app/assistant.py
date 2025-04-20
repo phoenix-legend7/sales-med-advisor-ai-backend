@@ -1,0 +1,212 @@
+import asyncio
+import httpx
+import re
+import string
+import os
+from starlette.websockets import WebSocketDisconnect, WebSocketState
+from deepgram import (
+    DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
+)
+from openai import AsyncOpenAI
+from app.config import settings
+
+DEEPGRAM_TTS_URL = 'https://api.deepgram.com/v1/speak?model=aura-luna-en'
+SYSTEM_PROMPT = """You are a helpful and enthusiastic assistant. Speak in a human, conversational tone.
+Keep your answers as short and concise as possible, like in a conversation, ideally no more than 120 characters.
+"""
+
+deepgram_config = DeepgramClientOptions(options={'keepalive': 'true'})
+deepgram = DeepgramClient(settings.DEEPGRAM_API_KEY, config=deepgram_config)
+dg_connection_options = LiveOptions(
+    model='nova-2',
+    language='en',
+    # Apply smart formatting to the output
+    smart_format=True,
+    # To get UtteranceEnd, the following must be set:
+    interim_results=True,
+    utterance_end_ms='1000',
+    vad_events=True,
+    # Time in milliseconds of silence to wait for before finalizing speech
+    endpointing=500,
+)
+openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+# groq = AsyncGroq(api_key=settings.GROQ_API_KEY)
+
+class Assistant:
+    def __init__(self, websocket, memory_size=10):
+        self.websocket = websocket
+        self.transcript_parts = []
+        self.transcript_queue = asyncio.Queue()
+        self.system_message = {'role': 'system', 'content': SYSTEM_PROMPT}
+        self.chat_messages = []
+        self.memory_size = memory_size
+        self.httpx_client = httpx.AsyncClient()
+        self.finish_event = asyncio.Event()
+        self.file_ids = []
+    
+    # async def assistant_chat(self, messages, model='llama-4-scout-17b-16e-instruct'):
+    #     res = await groq.chat.completions.create(messages=messages, model=model)
+    #     return res.choices[0].message.content
+    
+    async def assistant_chat(self, messages, model='gpt-4o'):
+        res = await openai_client.chat.completions.create(messages=messages, model=model)
+        return res.choices[0].message.content
+
+    async def assistant_chat_with_file(self, messages, file_ids, model='gpt-4o'):
+        """Create a chat completion that includes file context"""
+        # Create an Assistant
+        assistant = await openai_client.beta.assistants.create(
+            name="PDF Assistant",
+            model=model,
+            tools=[{"type": "retrieval"}],
+            file_ids=file_ids
+        )
+        
+        # Create a Thread
+        thread = await openai_client.beta.threads.create()
+        
+        # Add user message to the thread
+        user_message = messages[-1]['content']  # Get the latest user message
+        await openai_client.beta.threads.messages.create(
+            thread_id=thread.id,
+            role="user",
+            content=user_message
+        )
+        
+        # Run the Assistant
+        run = await openai_client.beta.threads.runs.create(
+            thread_id=thread.id,
+            assistant_id=assistant.id
+        )
+        
+        # Wait for the run to complete
+        while run.status != "completed":
+            await asyncio.sleep(1)
+            run = await openai_client.beta.threads.runs.retrieve(
+                thread_id=thread.id,
+                run_id=run.id
+            )
+            
+            if run.status == "failed":
+                return "Sorry, I couldn't process that request."
+        
+        # Get the messages
+        messages = await openai_client.beta.threads.messages.list(
+            thread_id=thread.id
+        )
+        
+        # Get the assistant's response (most recent message from assistant)
+        for msg in messages.data:
+            if msg.role == "assistant":
+                return msg.content[0].text.value
+        
+        return "No response generated."
+    
+    async def upload_pdf(self, file_path, file_name):
+        """Upload a PDF file to OpenAI and return the file ID"""
+        with open(file_path, 'rb') as f:
+            file = await openai_client.files.create(
+                file=f,
+                purpose='assistants'
+            )
+            self.file_ids.append(file.id)
+            return file.id
+    
+    def should_end_conversation(self, text):
+        text = text.translate(str.maketrans('', '', string.punctuation))
+        text = text.strip().lower()
+        return re.search(r'\b(goodbye|bye)\b$', text) is not None
+    
+    async def text_to_speech(self, text):
+        headers = {
+            'Authorization': f'Token {settings.DEEPGRAM_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+        async with self.httpx_client.stream(
+            'POST', DEEPGRAM_TTS_URL, headers=headers, json={'text': text}
+        ) as res:
+            async for chunk in res.aiter_bytes(1024):
+                await self.websocket.send_bytes(chunk)
+    
+    async def transcribe_audio(self):
+        async def on_message(self_handler, result, **kwargs):
+            try:
+                sentence = result.channel.alternatives[0].transcript
+                if len(sentence) == 0:
+                    return
+                if result.is_final:
+                    self.transcript_parts.append(sentence)
+                    await self.transcript_queue.put({'type': 'transcript_final', 'content': sentence})
+                    if result.speech_final:
+                        full_transcript = ' '.join(self.transcript_parts)
+                        self.transcript_parts = []
+                        await self.transcript_queue.put({'type': 'speech_final', 'content': full_transcript})
+                else:
+                    await self.transcript_queue.put({'type': 'transcript_interim', 'content': sentence})
+            except Exception as error:
+                raise Exception(str(error))
+        
+        async def on_utterance_end(self_handler, utterance_end, **kwargs):
+            if len(self.transcript_parts) > 0:
+                full_transcript = ' '.join(self.transcript_parts)
+                self.transcript_parts = []
+                await self.transcript_queue.put({'type': 'speech_final', 'content': full_transcript})
+
+        dg_connection = deepgram.listen.asynclive.v('1')
+        dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+        dg_connection.on(LiveTranscriptionEvents.UtteranceEnd, on_utterance_end)
+        if await dg_connection.start(dg_connection_options) is False:
+            raise Exception('Failed to connect to Deepgram')
+        
+        try:
+            while not self.finish_event.is_set():
+                # Receive audio stream from the client and send it to Deepgram to transcribe it
+                data = await self.websocket.receive_bytes()
+                await dg_connection.send(data)
+        finally:
+            await dg_connection.finish()
+    
+    async def manage_conversation(self):
+        try:
+            while not self.finish_event.is_set():
+                transcript = await self.transcript_queue.get()
+                if transcript['type'] == 'speech_final':
+                    if self.should_end_conversation(transcript['content']):
+                        self.finish_event.set()
+                        await self.websocket.send_json({'type': 'finish'})
+                        break
+
+                    self.chat_messages.append({'role': 'user', 'content': transcript['content']})
+                    if self.file_ids:
+                        response = await self.assistant_chat_with_file(
+                            [self.system_message] + self.chat_messages[-self.memory_size:],
+                            self.file_ids
+                        )
+                    else:
+                        response = await self.assistant_chat(
+                            [self.system_message] + self.chat_messages[-self.memory_size:]
+                        )
+                    self.chat_messages.append({'role': 'assistant', 'content': response})
+                    await self.websocket.send_json({'type': 'assistant', 'content': response})
+                    await self.text_to_speech(response)
+                else:
+                    await self.websocket.send_json(transcript)
+        except Exception as error:
+            raise Exception(str(error))
+    
+    async def add_pdf_context(self, file_path):
+        """Add a PDF file as context for the conversation"""
+        file_id = await self.upload_pdf(file_path, os.path.basename(file_path))
+        return file_id
+
+    async def run(self):
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self.transcribe_audio())
+                tg.create_task(self.manage_conversation())
+        except* WebSocketDisconnect:
+            print('Client disconnected')
+        finally:
+            await self.httpx_client.aclose()
+            if self.websocket.client_state != WebSocketState.DISCONNECTED:
+                await self.websocket.close()
