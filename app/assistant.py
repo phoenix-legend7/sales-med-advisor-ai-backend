@@ -1,5 +1,6 @@
 import asyncio
 import httpx
+import json
 import re
 import string
 import os
@@ -119,9 +120,23 @@ class Assistant:
         
         try:
             while not self.finish_event.is_set():
-                # Receive audio stream from the client and send it to Deepgram to transcribe it
-                data = await self.websocket.receive_bytes()
-                await dg_connection.send(data)
+                message = await self.websocket.receive()
+
+                if 'bytes' in message:
+                    audio_data = message["bytes"]
+                    await dg_connection.send(audio_data)
+                elif 'text' in message:
+                    try:
+                        json_data = message["text"]
+                        data = json.loads(json_data)
+                        await self.transcript_queue.put({'type': 'speech_final', 'content': data.get("content")})
+                    except Exception as error:
+                        print(f"Error processing JSON message: {str(error)}")
+                else:
+                    break
+        except Exception as error:
+            print(f"Error in transcribe_audio: {str(error)}")
+
         finally:
             await dg_connection.finish()
     
