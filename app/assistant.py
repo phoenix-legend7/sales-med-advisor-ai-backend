@@ -29,7 +29,12 @@ dg_connection_options = LiveOptions(
     # Time in milliseconds of silence to wait for before finalizing speech
     endpointing=500,
 )
-openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+openai_client = AsyncOpenAI(
+    api_key=settings.OPENAI_API_KEY,
+    http_client=httpx.AsyncClient(
+        proxy=settings.OPENAI_PROXY
+    )
+)
 # groq = AsyncGroq(api_key=settings.GROQ_API_KEY)
 
 class Assistant:
@@ -42,33 +47,28 @@ class Assistant:
         self.memory_size = memory_size
         self.httpx_client = httpx.AsyncClient()
         self.finish_event = asyncio.Event()
-        self.file_ids = []
+        self.file_id = None
+        self.is_first_message = True
     
     # async def assistant_chat(self, messages, model='llama-4-scout-17b-16e-instruct'):
     #     res = await groq.chat.completions.create(messages=messages, model=model)
     #     return res.choices[0].message.content
     
     async def assistant_chat(self, messages, model='gpt-4o'):
-        res = await openai_client.chat.completions.create(messages=messages, model=model)
-        return res.choices[0].message.content
+        try:
+            res = await openai_client.responses.create(input=messages, model=model)
+            return res.output_text
+        except Exception as error:
+            return str(error)
 
-    async def assistant_chat_with_file(self, messages, file_ids, model='gpt-4o'):
-        """Create a chat completion that includes file context"""
-        res = await openai_client.chat.completions.create(
-            model=model,
-            messages=messages,
-            file_ids=file_ids
-        )
-        return res.choices[0].message.content
-    
     async def upload_pdf(self, file_path, file_name):
         """Upload a PDF file to OpenAI and return the file ID"""
         with open(file_path, 'rb') as f:
             file = await openai_client.files.create(
                 file=f,
-                purpose='assistants'
+                purpose='user_data'
             )
-            self.file_ids.append(file.id)
+            self.file_id = file.id
             return file.id
     
     def should_end_conversation(self, text):
@@ -134,17 +134,26 @@ class Assistant:
                         self.finish_event.set()
                         await self.websocket.send_json({'type': 'finish'})
                         break
-
-                    self.chat_messages.append({'role': 'user', 'content': transcript['content']})
-                    if self.file_ids:
-                        response = await self.assistant_chat_with_file(
-                            [self.system_message] + self.chat_messages[-self.memory_size:],
-                            self.file_ids
-                        )
+                    if self.is_first_message and self.file_id:
+                        self.chat_messages.append({
+                            'role': 'user',
+                            'content': [
+                                {
+                                    'type': 'input_file',
+                                    'file_id': self.file_id
+                                }, {
+                                    'type': 'input_text',
+                                    'text': transcript['content']
+                                }
+                            ]
+                        })
+                        self.is_first_message = False
                     else:
-                        response = await self.assistant_chat(
-                            [self.system_message] + self.chat_messages[-self.memory_size:]
-                        )
+                        self.chat_messages.append({'role': 'user', 'content': transcript['content']})
+
+                    response = await self.assistant_chat(
+                        [self.system_message] + self.chat_messages[-self.memory_size:]
+                    )
                     self.chat_messages.append({'role': 'assistant', 'content': response})
                     await self.websocket.send_json({'type': 'assistant', 'content': response})
                     await self.text_to_speech(response)
