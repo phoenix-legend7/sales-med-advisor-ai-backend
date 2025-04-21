@@ -31,9 +31,9 @@ dg_connection_options = LiveOptions(
 )
 openai_client = AsyncOpenAI(
     api_key=settings.OPENAI_API_KEY,
-    http_client=httpx.AsyncClient(
-        proxy=settings.OPENAI_PROXY
-    )
+    # http_client=httpx.AsyncClient(
+    #     proxy=settings.OPENAI_PROXY
+    # )
 )
 # groq = AsyncGroq(api_key=settings.GROQ_API_KEY)
 

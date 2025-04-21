@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     # GROQ_API_KEY: str
     DEEPGRAM_API_KEY: str
     OPENAI_API_KEY: str
-    OPENAI_PROXY: str | None = None
+    # OPENAI_PROXY: str | None = None
 
     model_config = SettingsConfigDict(env_file='.env')
 
