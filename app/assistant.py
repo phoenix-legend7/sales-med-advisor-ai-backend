@@ -4,6 +4,7 @@ import json
 import re
 import string
 import os
+import typing
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 from deepgram import (
     DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
@@ -123,7 +124,7 @@ class Assistant:
                 message = await self.websocket.receive()
 
                 if 'bytes' in message:
-                    audio_data = message["bytes"]
+                    audio_data = typing.cast(bytes, message["bytes"])
                     await dg_connection.send(audio_data)
                 elif 'text' in message:
                     try:
