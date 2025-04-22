@@ -50,7 +50,6 @@ class Assistant:
         self.httpx_client = httpx.AsyncClient()
         self.finish_event = asyncio.Event()
         self.file_id = None
-        self.is_first_message = True
     
     # async def assistant_chat(self, messages, model='llama-4-scout-17b-16e-instruct'):
     #     res = await groq.chat.completions.create(messages=messages, model=model)
@@ -105,7 +104,7 @@ class Assistant:
                 else:
                     await self.transcript_queue.put({'type': 'transcript_interim', 'content': sentence})
             except Exception as error:
-                raise Exception(str(error))
+                print(str(error))
         
         async def on_utterance_end(self_handler, utterance_end, **kwargs):
             if len(self.transcript_parts) > 0:
@@ -117,7 +116,8 @@ class Assistant:
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
         dg_connection.on(LiveTranscriptionEvents.UtteranceEnd, on_utterance_end)
         if await dg_connection.start(dg_connection_options) is False:
-            raise Exception('Failed to connect to Deepgram')
+            print('Failed to connect to Deepgram')
+            return
         
         try:
             while not self.finish_event.is_set():
@@ -130,7 +130,11 @@ class Assistant:
                     try:
                         json_data = message["text"]
                         data = json.loads(json_data)
-                        await self.transcript_queue.put({'type': 'speech_final', 'content': data.get("content")})
+                        if data.get("type") == "attach":
+                            file_id = await self.add_pdf_context(data.get("content"))
+                            self.file_id = file_id
+                        else:
+                            await self.transcript_queue.put({'type': 'speech_final', 'content': data.get("content")})
                     except Exception as error:
                         print(f"Error processing JSON message: {str(error)}")
                 else:
@@ -150,7 +154,7 @@ class Assistant:
                         self.finish_event.set()
                         await self.websocket.send_json({'type': 'finish'})
                         break
-                    if self.is_first_message and self.file_id:
+                    if self.file_id:
                         self.chat_messages.append({
                             'role': 'user',
                             'content': [
@@ -163,7 +167,7 @@ class Assistant:
                                 }
                             ]
                         })
-                        self.is_first_message = False
+                        self.file_id = None
                     else:
                         self.chat_messages.append({'role': 'user', 'content': transcript['content']})
 
@@ -176,7 +180,7 @@ class Assistant:
                 else:
                     await self.websocket.send_json(transcript)
         except Exception as error:
-            raise Exception(str(error))
+            print(str(error))
     
     async def add_pdf_context(self, file_path):
         """Add a PDF file as context for the conversation"""

@@ -40,13 +40,6 @@ async def websocket_listen(websocket: WebSocket):
     await websocket.accept()
     assistant = Assistant(websocket)
     try:
-        data = await websocket.receive_json()
-        if "file_path" in data:
-            file_path = data["file_path"]
-            if os.path.exists(file_path) and file_path.startswith("uploads/"):
-                file_id = await assistant.add_pdf_context(file_path)
-                await websocket.send_json({"type": "file_uploaded", "file_id": file_id})
-        print('Wait for voice')
         await asyncio.wait_for(assistant.run(), timeout=30000)
     except TimeoutError:
         print('Connection timeout')
