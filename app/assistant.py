@@ -9,7 +9,8 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from deepgram import (
     DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
 )
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, AssistantEventHandler
+from typing_extensions import override
 from app.config import settings
 
 DEEPGRAM_TTS_URL = 'https://api.deepgram.com/v1/speak?model=aura-luna-en'
@@ -31,13 +32,7 @@ dg_connection_options = LiveOptions(
     # Time in milliseconds of silence to wait for before finalizing speech
     endpointing=500,
 )
-openai_client = AsyncOpenAI(
-    api_key=settings.OPENAI_API_KEY,
-    # http_client=httpx.AsyncClient(
-    #     proxy=settings.OPENAI_PROXY
-    # )
-)
-# groq = AsyncGroq(api_key=settings.GROQ_API_KEY)
+openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 class Assistant:
     def __init__(self, websocket, memory_size=10):
@@ -50,16 +45,66 @@ class Assistant:
         self.httpx_client = httpx.AsyncClient()
         self.finish_event = asyncio.Event()
         self.file_id = None
-    
-    # async def assistant_chat(self, messages, model='llama-4-scout-17b-16e-instruct'):
-    #     res = await groq.chat.completions.create(messages=messages, model=model)
-    #     return res.choices[0].message.content
-    
-    async def assistant_chat(self, messages, model='gpt-4o'):
+
+    async def assistant_chat(self, messages: list[dict], model='gpt-4o'):
+        """
+        messages: list of {"role": "user"|"assistant", "content": str}
+        """
         try:
-            res = await openai_client.responses.create(input=messages, model=model)
-            return res.output_text
+            if not hasattr(self, 'assistant_id'):
+                assistant = await openai_client.beta.assistants.retrieve(
+                    assistant_id=settings.OPENAI_ASSISTANT_ID
+                )
+                thread = await openai_client.beta.threads.create()
+                self.assistant_id = assistant.id
+                self.thread_id = thread.id
+
+            # for msg in messages:
+            msg = messages[-1]
+            await openai_client.beta.threads.messages.create(
+                thread_id=self.thread_id,
+                role=msg['role'],
+                content=msg['content'],
+                attachments=msg['attachments'] if 'attachments' in msg else None,
+            )
+
+            # stream_manager = openai_client.beta.threads.runs.stream(
+            #     thread_id=self.thread_id,
+            #     assistant_id=self.assistant_id,
+            #     # event_handler=EventHandler(self.websocket),
+            # )
+            # async with stream_manager as stream:
+            #     async for event in stream:
+            #         print(event)
+            #         if event.event == 'thread.message.delta':
+            #             print(event.data)
+            #             # await self.websocket.send_json(event.data)
+            #         elif event.event == 'thread.message.completed':
+            #             print(event.data.content)
+            #             # await self.websocket.send_json(event.data)
+            #     await stream.until_done()
+
+            run = await openai_client.beta.threads.runs.create_and_poll(
+                thread_id=self.thread_id,
+                assistant_id=self.assistant_id,
+                # (if there were a `stream=True` flag here in the beta API, you’d pass it)
+            )
+            msgs = await openai_client.beta.threads.messages.list(
+                thread_id=self.thread_id
+            )
+            assistant_replies = [
+                m for m in msgs.data
+                if m.role == 'assistant'
+            ]
+            full_response = ''
+            for reply in assistant_replies[0:1]:
+                text = reply.content[0].text.value
+                full_response += text
+
+            return full_response
+        
         except Exception as error:
+            print(error)
             return str(error)
 
     async def upload_pdf(self, file_path, file_name):
@@ -157,13 +202,11 @@ class Assistant:
                     if self.file_id:
                         self.chat_messages.append({
                             'role': 'user',
-                            'content': [
+                            'content': transcript['content'],
+                            'attachments': [
                                 {
-                                    'type': 'input_file',
+                                    'tools': [{"type": "code_interpreter"}],
                                     'file_id': self.file_id
-                                }, {
-                                    'type': 'input_text',
-                                    'text': transcript['content']
                                 }
                             ]
                         })
@@ -172,7 +215,8 @@ class Assistant:
                         self.chat_messages.append({'role': 'user', 'content': transcript['content']})
 
                     response = await self.assistant_chat(
-                        [self.system_message] + self.chat_messages[-self.memory_size:]
+                        self.chat_messages[-self.memory_size:]
+                        # [self.system_message] + self.chat_messages[-self.memory_size:]
                     )
                     self.chat_messages.append({'role': 'assistant', 'content': response})
                     await self.websocket.send_json({'type': 'assistant', 'content': response})
