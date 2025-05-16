@@ -52,9 +52,8 @@ class Assistant:
         """
         try:
             if not hasattr(self, 'assistant_id'):
-                assistant = await openai_client.beta.assistants.retrieve(
-                    assistant_id=settings.OPENAI_ASSISTANT_ID
-                )
+                assistants = await openai_client.beta.assistants.list(limit=1)
+                assistant = assistants.data[0]
                 thread = await openai_client.beta.threads.create()
                 self.assistant_id = assistant.id
                 self.thread_id = thread.id
