@@ -9,8 +9,7 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from deepgram import (
     DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
 )
-from openai import AsyncOpenAI, AssistantEventHandler
-from typing_extensions import override
+from openai import AsyncOpenAI
 from app.config import settings
 
 DEEPGRAM_TTS_URL = 'https://api.deepgram.com/v1/speak?model=aura-luna-en'
@@ -23,13 +22,10 @@ deepgram = DeepgramClient(settings.DEEPGRAM_API_KEY, config=deepgram_config)
 dg_connection_options = LiveOptions(
     model='nova-2',
     language='en',
-    # Apply smart formatting to the output
     smart_format=True,
-    # To get UtteranceEnd, the following must be set:
     interim_results=True,
     utterance_end_ms='1000',
     vad_events=True,
-    # Time in milliseconds of silence to wait for before finalizing speech
     endpointing=500,
 )
 openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
@@ -58,7 +54,6 @@ class Assistant:
                 self.assistant_id = assistant.id
                 self.thread_id = thread.id
 
-            # for msg in messages:
             msg = messages[-1]
             await openai_client.beta.threads.messages.create(
                 thread_id=self.thread_id,
@@ -86,7 +81,6 @@ class Assistant:
             run = await openai_client.beta.threads.runs.create_and_poll(
                 thread_id=self.thread_id,
                 assistant_id=self.assistant_id,
-                # (if there were a `stream=True` flag here in the beta API, you’d pass it)
             )
             msgs = await openai_client.beta.threads.messages.list(
                 thread_id=self.thread_id
