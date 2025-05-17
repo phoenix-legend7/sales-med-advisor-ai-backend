@@ -5,10 +5,11 @@ import re
 import string
 import os
 import typing
+from elevenlabs import stream
+from elevenlabs.client import ElevenLabs
+from io import BytesIO
 from starlette.websockets import WebSocketDisconnect, WebSocketState
-from deepgram import (
-    DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
-)
+
 from openai import AsyncOpenAI
 from app.config import settings
 
@@ -17,17 +18,7 @@ SYSTEM_PROMPT = """You are a helpful and enthusiastic assistant. Speak in a huma
 Keep your answers as short and concise as possible, like in a conversation, ideally no more than 120 characters.
 """
 
-deepgram_config = DeepgramClientOptions(options={'keepalive': 'true'})
-deepgram = DeepgramClient(settings.DEEPGRAM_API_KEY, config=deepgram_config)
-dg_connection_options = LiveOptions(
-    model='nova-2',
-    language='en',
-    smart_format=True,
-    interim_results=True,
-    utterance_end_ms='1000',
-    vad_events=True,
-    endpointing=500,
-)
+client = ElevenLabs(api_key=settings.ELEVENLABS_API_KEY)
 openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 class Assistant:
@@ -116,54 +107,39 @@ class Assistant:
         return re.search(r'\b(goodbye|bye)\b$', text) is not None
     
     async def text_to_speech(self, text):
-        headers = {
-            'Authorization': f'Token {settings.DEEPGRAM_API_KEY}',
-            'Content-Type': 'application/json'
-        }
-        async with self.httpx_client.stream(
-            'POST', DEEPGRAM_TTS_URL, headers=headers, json={'text': text}
-        ) as res:
-            async for chunk in res.aiter_bytes(1024):
-                await self.websocket.send_bytes(chunk)
+        audio_stream = client.text_to_speech.convert_as_stream(
+            text=text,
+            voice_id=settings.ELEVENLABS_VOICE_ID,
+            model_id="eleven_flash_v2_5",
+            output_format="mp3_44100_128",
+            language_code="fr",
+        )
+        for chunk in audio_stream:
+            await self.websocket.send_bytes(chunk)
     
     async def transcribe_audio(self):
-        async def on_message(self_handler, result, **kwargs):
+        buffer = bytearray()
+        while not self.finish_event.is_set():
+            message = await self.websocket.receive()
             try:
-                sentence = result.channel.alternatives[0].transcript
-                if len(sentence) == 0:
-                    return
-                if result.is_final:
-                    self.transcript_parts.append(sentence)
-                    await self.transcript_queue.put({'type': 'transcript_final', 'content': sentence})
-                    if result.speech_final:
-                        full_transcript = ' '.join(self.transcript_parts)
-                        self.transcript_parts = []
-                        await self.transcript_queue.put({'type': 'speech_final', 'content': full_transcript})
-                else:
-                    await self.transcript_queue.put({'type': 'transcript_interim', 'content': sentence})
-            except Exception as error:
-                print(str(error))
-        
-        async def on_utterance_end(self_handler, utterance_end, **kwargs):
-            if len(self.transcript_parts) > 0:
-                full_transcript = ' '.join(self.transcript_parts)
-                self.transcript_parts = []
-                await self.transcript_queue.put({'type': 'speech_final', 'content': full_transcript})
+                if "bytes" in message:
+                    buffer.extend(message["bytes"])
 
-        dg_connection = deepgram.listen.asynclive.v('1')
-        dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
-        dg_connection.on(LiveTranscriptionEvents.UtteranceEnd, on_utterance_end)
-        if await dg_connection.start(dg_connection_options) is False:
-            print('Failed to connect to Deepgram')
-            return
-        
-        try:
-            while not self.finish_event.is_set():
-                message = await self.websocket.receive()
+                    if len(buffer) > 3:
+                        bio = BytesIO(buffer)
+                        transcription = client.speech_to_text.convert(
+                            file=bio,
+                            model_id="scribe_v1",
+                            tag_audio_events=True,
+                            language_code="fr",
+                            diarize=False,
+                        )
+                        text = transcription["text"]
+                        await self.transcript_queue.put({
+                            "type": "speech_final", "content": text
+                        })
+                        buffer.clear()
 
-                if 'bytes' in message:
-                    audio_data = typing.cast(bytes, message["bytes"])
-                    await dg_connection.send(audio_data)
                 elif 'text' in message:
                     try:
                         json_data = message["text"]
@@ -177,11 +153,9 @@ class Assistant:
                         print(f"Error processing JSON message: {str(error)}")
                 else:
                     break
-        except Exception as error:
-            print(f"Error in transcribe_audio: {str(error)}")
 
-        finally:
-            await dg_connection.finish()
+            except Exception as error:
+                print(f"Error in transcribe_audio: {str(error)}")
     
     async def manage_conversation(self):
         try:
